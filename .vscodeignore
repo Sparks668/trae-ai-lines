@@ -1,0 +1,15 @@
+his/**
+.claude/**
+.__probe_write
+.git-ai-ignore
+*.vsix
+test.js
+scripts/test-panel.js
+scripts/test-diagnose.js
+scripts/test-buffer.js
+scripts/test-details-query.js
+scripts/test-repository-discovery.js
+test-fixtures/**
+DESIGN.md
+使用说明.md
+安装说明.md

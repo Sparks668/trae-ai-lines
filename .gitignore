@@ -1,0 +1,9 @@
+# local tool settings (contains personal paths)
+.claude/
+
+# build artifacts and version archives
+*.vsix
+his/
+
+# macOS
+.DS_Store

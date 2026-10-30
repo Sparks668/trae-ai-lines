@@ -1,0 +1,50 @@
+{
+  "name": "trae-ai-lines",
+  "displayName": "Trae AI Lines",
+  "description": "状态栏：今日 AI 提交行数 / 总提交行数（解析 Trae 日志统计）",
+  "version": "0.2.44",
+  "publisher": "bobchen",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiLines.refresh",
+        "title": "Trae AI Lines: Refresh"
+      },
+      {
+        "command": "aiLines.diagnose",
+        "title": "Trae AI Lines: Diagnose"
+      },
+      {
+        "command": "aiLines.showDetails",
+        "title": "Trae AI Lines: Show Details"
+      },
+      {
+        "command": "aiLines.guardToggle",
+        "title": "AI-GIT: Toggle"
+      },
+      {
+        "command": "aiLines.guardEnableAll",
+        "title": "AI-GIT: Enable All Workspace Repositories"
+      },
+      {
+        "command": "aiLines.guardSetThreshold",
+        "title": "AI-GIT: Set Threshold"
+      },
+      {
+        "command": "aiLines.guardToggleImport",
+        "title": "AI-GIT: Toggle Import Guard"
+      }
+    ]
+  }
+}
