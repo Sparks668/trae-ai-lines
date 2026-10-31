@@ -2,6 +2,8 @@ his/**
 .claude/**
 .__probe_write
 .git-ai-ignore
+.gitignore
+.github/**
 *.vsix
 test.js
 scripts/test-panel.js
