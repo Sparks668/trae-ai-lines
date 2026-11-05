@@ -16,6 +16,8 @@ let refreshing = false;
 let diagnosing = false;
 let diagnosticOutput;
 let refreshGuard;
+const LOG_SOURCES = { native: 'daemon 原生日志', mirror: '镜像日志（备用）',
+  'native+mirror': '原生日志＋备用镜像', none: '无可读日志' };
 
 function currentWorkspace() {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null;
@@ -45,7 +47,8 @@ async function refresh(manual) {
   try {
     const t0 = Date.now();
     const date = localDate();
-    await counter.poll(manual);
+    await counter.poll(true);
+    const logSource = LOG_SOURCES[counter.lastRead?.source] || '原生日志优先';
     const remain = SPIN_MIN_MS - (Date.now() - t0);
     if (remain > 0) await new Promise(r => setTimeout(r, remain));
     const { ai, total, commits } = counter.sums();
@@ -65,12 +68,12 @@ async function refresh(manual) {
         ? `\u672a\u63d0\u4ea4\uff1aAI ${pend.ai} \u884c\uff0c\u603b ${pend.total} \u884c\n`
         : `\u672a\u63d0\u4ea4\uff1a-\n`) +
       (diff ? `\u3000\u3000git diff\uff1a+${diff.adds} / -${diff.dels} \u884c\n` : '') +
-      `\n\u6570\u636e\u6e90\uff1a\u70b9\u51fb\u5b9e\u65f6\u8bfb\u53d6 daemon \u539f\u751f\u65e5\u5fd7\uff0c\u81ea\u52a8\u6bcf ${REFRESH_MS / 1000}s \u5237\u65b0\u955c\u50cf\u65e5\u5fd7` +
+      `\n数据源：${logSource}，自动每 ${REFRESH_MS / 1000}s 刷新` +
       '\n\n[\u5c55\u5f00\u8be6\u60c5](command:aiLines.showDetails)'
     );
     item.tooltip.isTrusted = { enabledCommands: ['aiLines.showDetails'] };
     snapshot = { date, committed: { ai, total, commits }, pending: pend, diff,
-      workspace: cwd || null, updatedAt: new Date().toISOString(), manual: !!manual };
+      workspace: cwd || null, updatedAt: new Date().toISOString(), manual: !!manual, logSource };
     refreshError = null;
   } catch (e) {
     item.text = prev || '$(robot) AI -';
@@ -111,9 +114,11 @@ async function runDiagnostics() {
   ch.clear();
   ch.show();
   const p = (ok, msg) => ch.appendLine(`${ok ? '[OK]  ' : '[MISS]'} ${msg}`);
-  const probe = f => {
-    try { const b = fs.readFileSync(f); ch.appendLine(`       [OK] \u53ef\u8bfb\u53d6 (${b.length}B) ${f}`); }
-    catch (e) { ch.appendLine(`       [MISS] \u8bfb\u53d6\u5931\u8d25: ${e.message} ${f}`); }
+  const reportRead = c => {
+    const report = c.lastRead;
+    ch.appendLine(`       实际来源：${LOG_SOURCES[report?.source] || '未知'}`);
+    for (const file of report?.files || []) ch.appendLine(`       [OK] 已读取 ${file}`);
+    for (const error of report?.errors || []) ch.appendLine(`       [MISS] ${error.file}: ${error.message}`);
   };
   const logRoot = process.platform === 'win32'
     ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Trae CN', 'logs')
@@ -132,34 +137,21 @@ async function runDiagnostics() {
   const intlRt = path.join(os.homedir(), '.trae', '.git-ai-tob', 'tob-git-ai-runtime');
   if (fs.existsSync(intlRt)) ch.appendLine(`       [\u6ce8\u610f] \u68c0\u6d4b\u5230\u56fd\u9645\u7248 git-ai \u8fd0\u884c\u65f6 ${intlRt}`);
   const natRoot = path.join(os.homedir(), '.trae-cn', '.git-ai-tob');
-  let natFile = null;
-  if (fs.existsSync(natRoot)) {
-    const want = `git-ai-daemon-${localDate()}.log`;
-    for (const id of fs.readdirSync(natRoot)) {
-      const d = path.join(natRoot, id, 'internal', 'daemon', 'logs');
-      if (!fs.existsSync(d)) continue;
-      const names = fs.readdirSync(d);
-      p(names.includes(want), `native daemon \u65e5\u5fd7 (${id}): ${want}`);
-      if (names.includes(want)) natFile = path.join(d, want);
-      else if (names.length) ch.appendLine(`       \u76ee\u5f55\u5185\u5b9e\u9645\u6587\u4ef6: ${names.slice(0, 5).join(', ')}`);
-    }
-  } else {
-    p(false, `native \u6839\u76ee\u5f55 ${natRoot}`);
-  }
-  if (natFile) probe(natFile);
-  else ch.appendLine(`       \u672a\u53d1\u73b0\u4efb\u4f55\u4eca\u65e5 native daemon \u65e5\u5fd7`);
+  p(fs.existsSync(natRoot), `native 根目录 ${natRoot}`);
+  ch.appendLine('       查找今天命名或今天更新的日志；按事件日期统计');
   if (fs.existsSync(logRoot)) {
     ch.appendLine(`       logs \u76ee\u5f55\u9876\u5c42: ${fs.readdirSync(logRoot).slice(0, 8).join(' | ') || '\u65e0'}`);
   }
   const cMir = new AiLinesCounter();
   const mir = cMir.listFiles(false);
   ch.appendLine(`       \u955c\u50cf\u65e5\u5fd7\u6587\u4ef6\u6570: ${mir.length}`);
-  if (mir.length) probe(mir[0]);
   await cMir.poll(false);
+  reportRead(cMir);
   ch.appendLine(`       \u955c\u50cf\u6e90\u7edf\u8ba1: ${JSON.stringify(cMir.sums())}`);
   const cNat = new AiLinesCounter();
   await cNat.poll(true);
-  ch.appendLine(`       native \u6e90\u7edf\u8ba1: ${JSON.stringify(cNat.sums())}`);
+  reportRead(cNat);
+  ch.appendLine(`       原生优先统计（不可用时回退镜像）: ${JSON.stringify(cNat.sums())}`);
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   ch.appendLine(`       \u5de5\u4f5c\u533a: ${cwd || '\u672a\u6253\u5f00'}`);
   if (cwd) {

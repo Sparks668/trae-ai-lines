@@ -21,80 +21,136 @@ class AiLinesCounter {
     this.logRoot = logRoot;
     // ponytail: native daemon log is near-realtime but lives in an internal dir; falls back to mirror logs when absent
     this.nativeRoot = nativeRoot || path.join(os.homedir(), '.trae-cn', '.git-ai-tob');
-    this.offsets = new Map();   // file -> read byte offset, for incremental reads
+    this.offsets = new Map();   // file -> identity and byte offset, for incremental reads
     this.day = localDate();
     this.entries = new Map();   // "commit|file" -> payload, latest event wins
     this.superseded = new Set(); // amended hashes stay excluded when another log source arrives late
+    this.lastRead = { source: 'none', files: [], errors: [] };
   }
 
-  listFiles(native) {
+  listFiles(native = true, errors = []) {
     if (native) {
-      const nat = this._nativeFiles();
+      const nat = this._nativeFiles(errors);
       if (nat.length) return nat;
     }
     const out = [];
-    let sessions;
-    try { sessions = fs.readdirSync(this.logRoot); } catch { return out; }
-    // ponytail: scan only the last 3 days of session dirs; covers cross-day sessions
-    const keepFrom = localDate(new Date(Date.now() - 3 * 864e5)).replace(/-/g, '');
-    for (const s of sessions) {
-      if (/^\d{8}T/.test(s) && s.slice(0, 8) < keepFrom) continue;
-      this._walk(path.join(this.logRoot, s), out);
+    // Sessions can keep writing for weeks. Search the output-log layout,
+    // without recursively walking every extension's files.
+    for (const s of this._dirEntries(this.logRoot, errors)) {
+      if (!s.isDirectory() || !/^\d{8}T/.test(s.name)) continue;
+      const session = path.join(this.logRoot, s.name);
+      this._mirrorLogs(session, out, errors); // Older/standalone mirror layouts.
+      for (const w of this._dirEntries(session, errors)) {
+        if (!w.isDirectory() || !/^window\d+$/.test(w.name)) continue;
+        const host = path.join(session, w.name, 'exthost');
+        for (const output of this._dirEntries(host, errors)) {
+          if (output.isDirectory() && output.name.startsWith('output_logging_')) {
+            this._mirrorLogs(path.join(host, output.name), out, errors);
+          }
+        }
+      }
     }
     return out;
   }
 
-  _nativeFiles() {
+  _nativeFiles(errors = []) {
     const out = [];
-    let ids;
-    try { ids = fs.readdirSync(this.nativeRoot); } catch { return out; }
     const want = `git-ai-daemon-${this.day}.log`;
-    for (const id of ids) {
-      const f = path.join(this.nativeRoot, id, 'internal', 'daemon', 'logs', want);
-      try { if (fs.statSync(f).isFile()) out.push(f); } catch { /* not a log dir */ }
+    const homes = [this.nativeRoot, ...this._dirEntries(this.nativeRoot, errors)
+      .filter(e => e.isDirectory()).map(e => path.join(this.nativeRoot, e.name))];
+    for (const home of homes) {
+      const dir = path.join(home, 'internal', 'daemon', 'logs');
+      for (const entry of this._dirEntries(dir, errors)) {
+        if (!entry.isFile() || !/^git-ai-daemon-\d{4}-\d{2}-\d{2}\.log$/.test(entry.name)) continue;
+        const file = path.join(dir, entry.name);
+        if (entry.name === want || this._updatedToday(file, errors)) out.push(file);
+      }
     }
     return out;
   }
 
-  _walk(dir, out) {
-    let names;
-    try { names = fs.readdirSync(dir); } catch { return; }
-    for (const n of names) {
-      const p = path.join(dir, n);
-      let st;
-      try { st = fs.statSync(p); } catch { continue; }
-      if (st.isDirectory()) this._walk(p, out);
-      else if (n.endsWith('Trae Coding Analysis Daemon.log')) out.push(p);
+  _discoveryError(file, error, errors) {
+    // Optional tenant/output directories may not exist. Access and I/O
+    // failures are different: retain them so native reads can fall back.
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') {
+      errors.push({ file, message: error.message });
+    }
+  }
+
+  _dirEntries(dir, errors) {
+    try { return fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { this._discoveryError(dir, e, errors); return []; }
+  }
+
+  _updatedToday(file, errors) {
+    try { return fs.statSync(file).mtimeMs >= new Date(`${this.day}T00:00:00`).getTime(); }
+    catch (e) { this._discoveryError(file, e, errors); return false; }
+  }
+
+  _mirrorLogs(dir, out, errors) {
+    for (const entry of this._dirEntries(dir, errors)) {
+      if (!entry.isFile() || !entry.name.endsWith('Trae Coding Analysis Daemon.log')) continue;
+      const file = path.join(dir, entry.name);
+      if (this._updatedToday(file, errors)) out.push(file);
     }
   }
 
   async _readNew(file) {
-    const st = await fs.promises.stat(file);
-    let off = this.offsets.get(file) || 0;
-    if (st.size < off) off = 0; // file was rotated/truncated, re-read from start
-    if (st.size <= off) return [];
+    const previous = this.offsets.get(file);
+    const offsetFor = st => previous && previous.dev === st.dev && previous.ino === st.ino
+      && previous.birthtimeMs === st.birthtimeMs && st.size >= previous.offset ? previous.offset : 0;
+    let st = await fs.promises.stat(file);
+    let off = offsetFor(st);
+    const save = offset => this.offsets.set(file,
+      { offset, dev: st.dev, ino: st.ino, birthtimeMs: st.birthtimeMs });
+    if (st.size <= off) { save(off); return []; }
     const fh = await fs.promises.open(file, 'r');
     try {
+      // The path may have been replaced after stat. Use the opened file's
+      // identity and size before deciding where to resume.
+      st = await fh.stat();
+      off = offsetFor(st);
+      if (st.size <= off) { save(off); return []; }
       const buf = Buffer.alloc(st.size - off);
-      await fh.read(buf, 0, buf.length, off);
-      const text = buf.toString('utf8');
+      const { bytesRead } = await fh.read(buf, 0, buf.length, off);
+      const text = buf.toString('utf8', 0, bytesRead);
       const lastNl = text.lastIndexOf('\n');
-      if (lastNl === -1) return []; // no complete line yet, read next time
-      this.offsets.set(file, off + Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8'));
+      if (lastNl === -1) { save(off); return []; } // Retry the incomplete line next time.
+      save(off + Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8'));
       return text.slice(0, lastNl).split('\n');
     } finally {
       await fh.close();
     }
   }
 
-  async poll(native) {
-    const today = localDate();
-    if (today !== this.day) { this.day = today; this.entries.clear(); this.superseded.clear(); }
-    for (const f of this.listFiles(native)) {
-      let lines;
-      try { lines = await this._readNew(f); } catch { continue; }
-      this._absorb(lines);
-    }
+  async poll(native = true) {
+    const resetDay = () => {
+      const today = localDate();
+      if (today !== this.day) { this.day = today; this.entries.clear(); this.superseded.clear(); }
+    };
+    resetDay();
+    const report = { source: 'none', files: [], errors: [] };
+    const read = async (files, source) => {
+      let successes = 0;
+      for (const file of files) {
+        try {
+          const lines = await this._readNew(file);
+          resetDay(); // A file read may span midnight.
+          this._absorb(lines);
+          report.files.push(file);
+          successes++;
+        } catch (e) { report.errors.push({ file, message: e.message }); }
+      }
+      if (successes) report.source = report.source === 'none' ? source : `${report.source}+${source}`;
+    };
+    if (native) {
+      await read(this._nativeFiles(report.errors), 'native');
+      // A readable zero is valid. Supplement unreadable native files with
+      // mirrors; existing commit/file deduplication handles source overlap.
+      if (!report.files.length || report.errors.length) await read(this.listFiles(false, report.errors), 'mirror');
+    } else await read(this.listFiles(false, report.errors), 'mirror');
+    this.lastRead = report;
+    return report;
   }
 
   _absorb(lines) {
@@ -286,7 +342,7 @@ module.exports = { AiLinesCounter, localDate, uncommitted, gitDiffStat };
 if (require.main === module) {
   (async () => {
     const mirror = new AiLinesCounter();
-    await mirror.poll();
+    await mirror.poll(false);
     const ms = mirror.sums();
     const nat = new AiLinesCounter();
     await nat.poll(true);

@@ -38,7 +38,11 @@ const until = async condition => {
     let sums = { ai: 12, total: 20, commits: 2 }, pending = { ai: 6, total: 8, gitAdds: 108, gitDels: 4 };
     let pollError = null, pendingGate = null, pendingQueries = 0; const polls = [];
     class Counter {
-      async poll(native) { polls.push(!!native); if (pollError) throw pollError; }
+      async poll(native) {
+        polls.push(!!native);
+        if (pollError) throw pollError;
+        this.lastRead = { source: 'native', files: ['/test/git-ai-daemon-2026-10-29.log'], errors: [] };
+      }
       sums() { return { ...sums }; }
       listFiles() { return []; }
     }
@@ -96,6 +100,7 @@ const until = async condition => {
     check('activation keeps one refresh timer and creates no panel eagerly', () => {
       assert.strictEqual(timers.length, 1); assert.strictEqual(timers[0].ms, 30000); assert.strictEqual(panels.length, 0);
     });
+    check('startup and automatic refresh prefer native logs', () => assert.strictEqual(polls[0], true));
     check('tooltip exposes only the details command as a trusted link', () => {
       assert(items[0].tooltip.value.includes('command:aiLines.showDetails'));
       assert.deepStrictEqual(Array.from(items[0].tooltip.isTrusted.enabledCommands), ['aiLines.showDetails']);
@@ -112,11 +117,13 @@ const until = async condition => {
       assert.strictEqual(d.diff.adds, 108); assert.strictEqual(d.diff.dels, 4);
       assert.strictEqual(d.guards[0].threshold, 90); assert.strictEqual(d.guards[0].enabled, true);
       assert.strictEqual(d.guards[0].importOn, false); assert.strictEqual(d.workspace, repo); assert.strictEqual(d.version, pkg.version);
+      assert.strictEqual(d.logSource, 'daemon 原生日志');
     });
     await until(() => !lastData().refreshing);
     const queriesBeforeSharedRefresh = guardQueries;
     await timers[0].fn();
     await flush();
+    check('automatic refresh keeps the same native-first policy as manual refresh', () => assert.strictEqual(polls.at(-1), true));
     check('one refresh shares the guard query between status bar and open details', () => {
       assert.strictEqual(guardQueries - queriesBeforeSharedRefresh, 1);
       assert.strictEqual(lastData().refreshing, false);
