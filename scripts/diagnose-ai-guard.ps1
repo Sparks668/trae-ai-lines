@@ -214,17 +214,15 @@ if ($stateOk) {
 # ---- 4. git-ai 运行时二进制 ----
 Say "[4] git-ai 运行时"
 $bin = $null
+$runtimeExe = if ([Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) { 'git-ai.exe' } else { 'git-ai' }
 if (Test-Path -LiteralPath $runtimeRoot -PathType Container) {
   $vers = Get-ChildItem -LiteralPath $runtimeRoot -Directory -ErrorAction SilentlyContinue |
           Where-Object { $_.Name -match '^[0-9]+\.[0-9]+\.[0-9]+$' } |
           Sort-Object { [version]$_.Name } -Descending
   foreach ($v in $vers) {
     foreach ($p in (Get-ChildItem -LiteralPath $v.FullName -Directory -ErrorAction SilentlyContinue)) {
-      foreach ($exe in @('git-ai', 'git-ai.exe')) {
-        $cand = Join-Path (Join-Path $p.FullName 'host') $exe
-        if (Test-Path -LiteralPath $cand -PathType Leaf) { $bin = $cand; break }
-      }
-      if ($bin) { break }
+      $cand = Join-Path (Join-Path $p.FullName 'host') $runtimeExe
+      if (Test-Path -LiteralPath $cand -PathType Leaf) { $bin = $cand; break }
     }
     if ($bin) { break }
   }
@@ -232,7 +230,7 @@ if (Test-Path -LiteralPath $runtimeRoot -PathType Container) {
 if ($bin) {
   Pass "找到 $bin"
 } else {
-  Fail "未找到 git-ai 可执行文件（$runtimeRoot\*\*\host\git-ai）—— 规则1 fail-open" `
+  Fail "未找到 git-ai 可执行文件（$runtimeRoot\*\*\host\$runtimeExe）—— 规则1 fail-open" `
        "确认已安装本插件并打开过 Trae（runtime 由插件释放）；必要时重装插件"
 }
 
@@ -277,7 +275,7 @@ const git = args => execFileSync('git', args, {
   encoding: 'utf8', timeout: 15000, maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe']
 });
 try {
-  const records = git(['diff', '--cached', '--numstat', '-z']).split('\0');
+  const records = git(['-c', 'diff.relative=false', 'diff', '--cached', '--numstat', '-z']).split('\0');
   const files = [];
   for (let i = 0; i < records.length; i++) {
     const m = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(records[i]);
@@ -321,8 +319,7 @@ if (-not $diffOk) {
 } elseif ($rawTotal -eq 0) {
   Pass "本提交无新增行（仅删除/重命名/二进制），规则1不适用"
 } elseif ($visible -eq 0) {
-  Fail "暂存新增行全部落在 .git-ai-ignore 里（$rawTotal 行全部被忽略）→ 分母 visible=0，规则1整条跳过" `
-       "确认这些文件是否应被忽略；如需拦截，请从 .git-ai-ignore 移除对应模式"
+  Pass "暂存新增行均由 .git-ai-ignore 排除（$rawTotal 行全部被忽略），不适用占比校验"
 } else {
   Pass "暂存 $fileN 个文件：新增 $rawTotal 行，其中被忽略 $ignAdds 行 → 分母 $visible 行"
 }
@@ -348,22 +345,32 @@ if (-not $hasScript) {
   if (-not $diffOk) {
     Fail "暂存分母读取失败，无法验证钩子判定" "先解决 [6] 的读取错误"
   } elseif ($code -ne 0) {
-    if ($code -eq 1 -and $out -match '(?m)^\[ai-ratio\] BLOCKED: (ratio < [0-9.]+% threshold|bulk commit [0-9]+ lines with only [0-9]+ AI lines \(import guard\))\r?$') {
+    if ($code -eq 1 -and $out -match '(?m)^\[ai-ratio\] BLOCKED: (ratio > 100%|ratio < [0-9.]+% threshold|bulk commit [0-9]+ lines with only [0-9]+ AI lines \(import guard\))\r?$') {
       Pass "钩子正常执行，并按校验规则拦截提交"
     } else {
       Fail "校验脚本运行失败（退出码 $code），不是正常放行或规则拦截" `
            "查看上方错误，检查 Node.js 环境和 check-ai-ratio.js 是否损坏"
     }
+  } elseif ($out -match '(?m)^\[ai-ratio\] git (diff failed, skip check|directory unavailable, skip)\r?$') {
+    Fail "钩子未能读取 Git 数据，跳过了校验" "检查上方钩子输出和 Git 仓库状态后重试"
+  } elseif ($out -match '(?m)^\[ai-ratio\] disabled, skip\r?$') {
+    Fail "钩子重放时校验已关闭" "检查仓库开关或 AI_RATIO_OFF 后重试"
   } elseif ($rawTotal -eq 0) {
     Pass "无新增行，钩子直接放行属正常"
+  } elseif ($visible -eq 0) {
+    Pass "无参与占比校验的新增行，钩子放行属正常"
   } elseif ($out -match 'ratio [0-9]') {   # 判定行形如 "…, ratio 0.0%"；避免离线提示 "ratio check" 被误判
     Pass "钩子确实在做占比判定（见上面 ratio 行）"
   } else {
-    $skip = [regex]::Match($out, 'disabled, skip|daemon offline|git diff failed|import guard').Value
+    $skip = [regex]::Match($out, 'daemon offline|attribution query failed|import guard').Value
     $r = "有暂存改动，但钩子未做占比判定"
     if ($skip) { $r += "（跳过原因：$skip）" }
     $r += " —— 本次提交未被拦截"
-    Fail $r "按上面失败的检查项（[2]总开关 / [4]runtime / [5]daemon / [6]分母）逐项修复后重试"
+    $fix = "按上面失败的检查项（[2]总开关 / [4]runtime / [5]daemon / [6]分母）逐项修复后重试"
+    if ($skip -eq 'attribution query failed') {
+      $fix = "打开 Trae 的 Git AI 页面，点击「重新检查」，再运行本脚本"
+    }
+    Fail $r $fix
   }
 }
 
@@ -374,8 +381,7 @@ if ($script:nFail -eq 0) {
   Write-Host "============================================================"
   Write-Host @'
 若"非 AI 提交仍未被拦"，请对照 [7] 的 ratio 行进一步判断：
-  * 打印了 ratio ≥ 阈值 → 多为"整树污染"：git-ai 结算整个工作区而非暂存区，
-    未暂存的 AI 编辑抬高分子。把未暂存改动 stash 后再提交复验。
+  * 原始 AI 占比超过 100% 时会拦截。请核对部分暂存和 .git-ai-ignore。
   * 完全无 ratio 行     → 多为绕过了钩子，检查是否用 git commit --no-verify。
 '@
   exit 0

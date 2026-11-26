@@ -1,10 +1,15 @@
 {
   "name": "trae-ai-lines",
   "displayName": "Trae AI Lines",
-  "description": "状态栏：今日 AI 提交行数 / 总提交行数（解析 Trae 日志统计）",
-  "version": "0.2.45",
+  "description": "统计 Trae 的 AI 编码行数，并在 Git 提交时校验 AI 占比。",
+  "version": "0.2.46",
+  "icon": "icon.png",
   "publisher": "bobchen",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sparks668/trae-ai-lines.git"
+  },
   "engines": {
     "vscode": "^1.75.0"
   },

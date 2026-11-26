@@ -200,21 +200,22 @@ fi
 # ---- 4. git-ai 运行时二进制 ---------------------------------------------
 echo "[4] git-ai 运行时"
 FOUND_BIN=""
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) RUNTIME_EXE=git-ai.exe ;;
+  *) RUNTIME_EXE=git-ai ;;
+esac
 if [ -d "$RUNTIME_ROOT" ]; then
-  # sort -V 在 GNU sort 与较新 macOS 上可用；不支持时退回普通逆序，避免误报"找不到"。
-  if printf '0.2\n0.1\n' 2>/dev/null | sort -V >/dev/null 2>&1; then VSORT="-Vr"; else VSORT="-r"; fi
-  for v in $(ls "$RUNTIME_ROOT" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort $VSORT); do
+  for v in $(ls "$RUNTIME_ROOT" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1nr -k2,2nr -k3,3nr); do
     for plat in "$RUNTIME_ROOT/$v"/*; do
-      for exe in git-ai git-ai.exe; do
-        if [ -x "$plat/host/$exe" ]; then FOUND_BIN="$plat/host/$exe"; break 3; fi
-      done
+      candidate="$plat/host/$RUNTIME_EXE"
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then FOUND_BIN="$candidate"; break 2; fi
     done
   done
 fi
 if [ -n "$FOUND_BIN" ]; then
   pass "找到 $FOUND_BIN"
 else
-  failwith "未找到 git-ai 可执行文件（$RUNTIME_ROOT/*/*/host/git-ai）—— 规则1 fail-open" \
+  failwith "未找到 git-ai 可执行文件（$RUNTIME_ROOT/*/*/host/$RUNTIME_EXE）—— 规则1 fail-open" \
            "确认已安装本插件并打开过 Trae（runtime 由插件释放）；必要时重装插件"
 fi
 
@@ -266,7 +267,7 @@ const git = args => execFileSync('git', args, {
   encoding: 'utf8', timeout: 15000, maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe']
 });
 try {
-  const records = git(['diff', '--cached', '--numstat', '-z']).split('\0');
+  const records = git(['-c', 'diff.relative=false', 'diff', '--cached', '--numstat', '-z']).split('\0');
   const files = [];
   for (let i = 0; i < records.length; i++) {
     const m = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(records[i]);
@@ -303,8 +304,7 @@ elif [ "$fileN" -eq 0 ]; then
 elif [ "$rawTotal" -eq 0 ]; then
   pass "本提交无新增行（仅删除/重命名/二进制），规则1不适用"
 elif [ "$visible" -eq 0 ]; then
-  failwith "暂存新增行全部落在 .git-ai-ignore 里（$rawTotal 行全部被忽略）→ 分母 visible=0，规则1整条跳过" \
-           "确认这些文件是否应被忽略；如需拦截，请从 .git-ai-ignore 移除对应模式"
+  pass "暂存新增行均由 .git-ai-ignore 排除（$rawTotal 行全部被忽略），不适用占比校验"
 else
   pass "暂存 $fileN 个文件：新增 $rawTotal 行，其中被忽略 $ignAdds 行 → 分母 $visible 行"
 fi
@@ -324,22 +324,32 @@ if [ -f "$SCRIPT" ]; then
   if [ "$DIFF_OK" -ne 1 ]; then
     failwith "暂存分母读取失败，无法验证钩子判定" "先解决 [6] 的读取错误"
   elif [ "$CODE" -ne 0 ]; then
-    if [ "$CODE" -eq 1 ] && printf '%s\n' "$OUT" | grep -qE '^\[ai-ratio\] BLOCKED: (ratio < [0-9.]+% threshold|bulk commit [0-9]+ lines with only [0-9]+ AI lines \(import guard\))$'; then
+    if [ "$CODE" -eq 1 ] && printf '%s\n' "$OUT" | grep -qE '^\[ai-ratio\] BLOCKED: (ratio > 100%|ratio < [0-9.]+% threshold|bulk commit [0-9]+ lines with only [0-9]+ AI lines \(import guard\))$'; then
       pass "钩子正常执行，并按校验规则拦截提交"
     else
       failwith "校验脚本运行失败（退出码 ${CODE}），不是正常放行或规则拦截" \
                "查看上方错误，检查 Node.js 环境和 check-ai-ratio.js 是否损坏"
     fi
+  elif printf '%s\n' "$OUT" | grep -qE '^\[ai-ratio\] git (diff failed, skip check|directory unavailable, skip)$'; then
+    failwith "钩子未能读取 Git 数据，跳过了校验" "检查上方钩子输出和 Git 仓库状态后重试"
+  elif printf '%s\n' "$OUT" | grep -qF '[ai-ratio] disabled, skip'; then
+    failwith "钩子重放时校验已关闭" "检查仓库开关或 AI_RATIO_OFF 后重试"
   elif [ "$rawTotal" -eq 0 ]; then
     pass "无新增行，钩子直接放行属正常"
+  elif [ "$visible" -eq 0 ]; then
+    pass "无参与占比校验的新增行，钩子放行属正常"
   # 判定行形如 "…, ratio 0.0%"，用 "ratio 空格 数字" 精确匹配；
   # 否则离线提示 "AI-ratio check skipped" 里的 "ratio check" 会被误当成已判定。
   elif printf '%s' "$OUT" | grep -qE 'ratio [0-9]'; then
     pass "钩子确实在做占比判定（见上面 ratio 行）"
   else
-    SKIPREASON="$(printf '%s' "$OUT" | grep -oE 'disabled, skip|daemon offline|git diff failed|import guard' | head -1)"
+    SKIPREASON="$(printf '%s' "$OUT" | grep -oE 'daemon offline|attribution query failed|import guard' | head -1)"
+    FIX="按上面失败的检查项（[2]总开关 / [4]runtime / [5]daemon / [6]分母）逐项修复后重试"
+    if [ "$SKIPREASON" = 'attribution query failed' ]; then
+      FIX="打开 Trae 的 Git AI 页面，点击「重新检查」，再运行本脚本"
+    fi
     failwith "有暂存改动，但钩子未做占比判定${SKIPREASON:+（跳过原因：${SKIPREASON}）} —— 本次提交未被拦截" \
-             "按上面失败的检查项（[2]总开关 / [4]runtime / [5]daemon / [6]分母）逐项修复后重试"
+             "$FIX"
   fi
   fi
 else
@@ -353,8 +363,7 @@ if [ "$n_fail" -eq 0 ]; then
   echo "============================================================"
   cat <<'EOF'
 若"非 AI 提交仍未被拦"，请对照 [7] 的 ratio 行进一步判断：
-  * 打印了 ratio ≥ 阈值 → 多为"整树污染"：git-ai 结算整个工作区而非暂存区，
-    未暂存的 AI 编辑抬高分子。把未暂存改动 stash 后再提交复验。
+  * 原始 AI 占比超过 100% 时会拦截。请核对部分暂存和 .git-ai-ignore。
   * 完全无 ratio 行     → 多为绕过了钩子，检查是否用 git commit --no-verify。
 EOF
   rm -f "$NFILE"; exit 0

@@ -16,8 +16,7 @@ let refreshing = false;
 let diagnosing = false;
 let diagnosticOutput;
 let refreshGuard;
-const LOG_SOURCES = { native: 'daemon 原生日志', mirror: '镜像日志（备用）',
-  'native+mirror': '原生日志＋备用镜像', none: '无可读日志' };
+const COMMITTED_SOURCE = 'Trae 本地上报库';
 
 function currentWorkspace() {
   return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null;
@@ -46,34 +45,35 @@ async function refresh(manual) {
   details?.setRefreshing(true);
   try {
     const t0 = Date.now();
-    const date = localDate();
-    await counter.poll(true);
-    const logSource = LOG_SOURCES[counter.lastRead?.source] || '原生日志优先';
+    await counter.poll();
+    const date = counter.day || localDate();
+    const committed = counter.sums();
+    const dataSource = committed ? COMMITTED_SOURCE : counter.lastRead?.invalid
+      ? `${COMMITTED_SOURCE}数据不完整` : `${COMMITTED_SOURCE}不可用`;
     const remain = SPIN_MIN_MS - (Date.now() - t0);
     if (remain > 0) await new Promise(r => setTimeout(r, remain));
-    const { ai, total, commits } = counter.sums();
     const cwd = currentWorkspace();
     const pend = cwd ? await uncommitted(cwd) : null;
     // Git details remain available even when AI attribution cannot be queried.
     const diff = pend && pend.gitAdds != null
       ? { adds: pend.gitAdds, dels: pend.gitDels }
       : cwd ? await gitDiffStat(cwd) : null;
-    item.text = `$(robot) AI ${ai} / ${total} \u884c`;
+    item.text = committed ? `$(robot) AI ${committed.ai} / ${committed.total} \u884c` : '$(robot) AI -';
     item.tooltip = new vscode.MarkdownString(
       `**\u4eca\u65e5\u7edf\u8ba1\uff08${date}\uff09**\n\n` +
-      `AI Commit\uff1a${ai} \u884c\uff0c\n` +
-      `\u603bCommit\uff1a${total} \u884c\uff0c\n` +
-      `\u63d0\u4ea4\u6570\uff1a${commits}\n\n` +
+      (committed
+        ? `AI Commit：${committed.ai} 行，\n总Commit：${committed.total} 行，\n提交数：${committed.commits}\n\n`
+        : '今日提交：暂不可用\n\n') +
       (pend
         ? `\u672a\u63d0\u4ea4\uff1aAI ${pend.ai} \u884c\uff0c\u603b ${pend.total} \u884c\n`
         : `\u672a\u63d0\u4ea4\uff1a-\n`) +
       (diff ? `\u3000\u3000git diff\uff1a+${diff.adds} / -${diff.dels} \u884c\n` : '') +
-      `\n数据源：${logSource}，自动每 ${REFRESH_MS / 1000}s 刷新` +
+      `\n提交数据源：${dataSource}，自动每 ${REFRESH_MS / 1000}s 刷新` +
       '\n\n[\u5c55\u5f00\u8be6\u60c5](command:aiLines.showDetails)'
     );
     item.tooltip.isTrusted = { enabledCommands: ['aiLines.showDetails'] };
-    snapshot = { date, committed: { ai, total, commits }, pending: pend, diff,
-      workspace: cwd || null, updatedAt: new Date().toISOString(), manual: !!manual, logSource };
+    snapshot = { date, committed, pending: pend, diff,
+      workspace: cwd || null, updatedAt: new Date().toISOString(), manual: !!manual, dataSource };
     refreshError = null;
   } catch (e) {
     item.text = prev || '$(robot) AI -';
@@ -114,44 +114,22 @@ async function runDiagnostics() {
   ch.clear();
   ch.show();
   const p = (ok, msg) => ch.appendLine(`${ok ? '[OK]  ' : '[MISS]'} ${msg}`);
-  const reportRead = c => {
-    const report = c.lastRead;
-    ch.appendLine(`       实际来源：${LOG_SOURCES[report?.source] || '未知'}`);
-    for (const file of report?.files || []) ch.appendLine(`       [OK] 已读取 ${file}`);
-    for (const error of report?.errors || []) ch.appendLine(`       [MISS] ${error.file}: ${error.message}`);
-  };
-  const logRoot = process.platform === 'win32'
-    ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'Trae CN', 'logs')
-    : path.join(os.homedir(), 'Library', 'Application Support', 'Trae CN', 'logs');
-  p(fs.existsSync(logRoot), `\u65e5\u5fd7\u76ee\u5f55 ${logRoot}`);
   const rt = path.join(os.homedir(), '.trae-cn', '.git-ai-tob', 'tob-git-ai-runtime');
   p(fs.existsSync(rt), `git-ai \u8fd0\u884c\u65f6\u76ee\u5f55 ${rt}`);
   if (fs.existsSync(rt)) {
     const vs = fs.readdirSync(rt).filter(v => /^\d+\.\d+\.\d+$/.test(v));
     ch.appendLine(`       \u7248\u672c\u76ee\u5f55: ${vs.join(', ') || '\u65e0'}`);
   }
-  // committed-stats pipeline: per-tenant native log, actual filenames, read probe, both sources' sums
-  ch.appendLine(`--- \u5df2\u63d0\u4ea4\u7edf\u8ba1\u94fe\u8def (\u4eca\u65e5 ${localDate()}) ---`);
-  const intlLog = path.join(path.dirname(logRoot), 'Trae', 'logs');
-  if (fs.existsSync(intlLog)) ch.appendLine(`       [\u6ce8\u610f] \u68c0\u6d4b\u5230\u56fd\u9645\u7248\u65e5\u5fd7\u76ee\u5f55 ${intlLog}`);
-  const intlRt = path.join(os.homedir(), '.trae', '.git-ai-tob', 'tob-git-ai-runtime');
-  if (fs.existsSync(intlRt)) ch.appendLine(`       [\u6ce8\u610f] \u68c0\u6d4b\u5230\u56fd\u9645\u7248 git-ai \u8fd0\u884c\u65f6 ${intlRt}`);
-  const natRoot = path.join(os.homedir(), '.trae-cn', '.git-ai-tob');
-  p(fs.existsSync(natRoot), `native 根目录 ${natRoot}`);
-  ch.appendLine('       查找今天命名或今天更新的日志；按事件日期统计');
-  if (fs.existsSync(logRoot)) {
-    ch.appendLine(`       logs \u76ee\u5f55\u9876\u5c42: ${fs.readdirSync(logRoot).slice(0, 8).join(' | ') || '\u65e0'}`);
-  }
-  const cMir = new AiLinesCounter();
-  const mir = cMir.listFiles(false);
-  ch.appendLine(`       \u955c\u50cf\u65e5\u5fd7\u6587\u4ef6\u6570: ${mir.length}`);
-  await cMir.poll(false);
-  reportRead(cMir);
-  ch.appendLine(`       \u955c\u50cf\u6e90\u7edf\u8ba1: ${JSON.stringify(cMir.sums())}`);
-  const cNat = new AiLinesCounter();
-  await cNat.poll(true);
-  reportRead(cNat);
-  ch.appendLine(`       原生优先统计（不可用时回退镜像）: ${JSON.stringify(cNat.sums())}`);
+  const committed = new AiLinesCounter({ appRoot: vscode.env?.appRoot });
+  await committed.poll();
+  const stats = committed.sums();
+  const report = committed.lastRead;
+  ch.appendLine(`--- 已提交统计（按入库日期 ${committed.day || localDate()}） ---`);
+  p(!!stats, `${COMMITTED_SOURCE} ${committed.root || ''}`);
+  for (const file of report?.files || []) p(true, `已读取 ${file}`);
+  for (const error of report?.errors || []) p(false, `${error.file} ${error.message}`);
+  if (report?.invalid) p(false, `无法解析 ${report.invalid} 条提交归因记录`);
+  ch.appendLine(`       今日汇总：${stats ? JSON.stringify(stats) : '不可用'}`);
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   ch.appendLine(`       \u5de5\u4f5c\u533a: ${cwd || '\u672a\u6253\u5f00'}`);
   if (cwd) {
@@ -161,7 +139,7 @@ async function runDiagnostics() {
 }
 
 function activate(context) {
-  counter = new AiLinesCounter();
+  counter = new AiLinesCounter({ appRoot: vscode.env?.appRoot });
   diagnosticOutput = vscode.window.createOutputChannel('Trae AI Lines');
   // ponytail: Right side, just left of Trae++ feedback button; raise priority if crowded
   item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 9999);

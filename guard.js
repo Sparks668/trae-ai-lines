@@ -1,14 +1,35 @@
 'use strict';
-// guard.js: AI-ratio pre-commit hook manager, merged from ai-ratio-guard 0.1.0.
-// State lives in the repository's common Git directory; hooks may be shared
-// by unrelated repositories. Source stays ASCII-only (Chinese
-// via \u escapes) so no editor/file-encoding can ever garble it at runtime.
+// Manage AI ratio commit hooks. Settings live in the repository's common Git
+// directory, including when multiple repositories share a hook directory.
 const fs = require('fs');
 const path = require('path');
 const { execFile, execFileSync } = require('child_process');
 
 const SCRIPT = 'check-ai-ratio.js';
 const ENTRY = 'pre-commit';
+const REFERENCE_ENTRY = 'reference-transaction';
+const LEGACY_TRANSACTION_PRECOMMIT = new Set([
+  '#!/bin/sh\n# managed by ai-ratio-guard\nAI_RATIO_GIT_PID=$PPID exec node "$(dirname "$0")/check-ai-ratio.js" --pre-commit',
+  '#!/bin/sh\n# managed by ai-ratio-guard\nAI_RATIO_HOOK_PARENT=$PPID exec node "$(dirname "$0")/check-ai-ratio.js" --pre-commit'
+]);
+// Exact normalized templates from the older two-hook builds.
+const LEGACY_REFERENCE_HOOKS = new Set([
+  [
+    '#!/bin/sh', '# managed by ai-ratio-guard', '[ "$1" = prepared ] || exit 0',
+    'git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0',
+    'ticket="$git_dir/ai-ratio-commit-$PPID"', '[ -f "$ticket" ] || exit 0',
+    'exec node "$(dirname "$0")/check-ai-ratio.js" --reference-transaction "$ticket"'
+  ].join('\n'),
+  [
+    '#!/bin/sh', '# managed by ai-ratio-guard', '[ "$1" = prepared ] || exit 0',
+    'git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0',
+    'command -v node >/dev/null 2>&1 || exit 0',
+    'for ticket in "$git_dir"/ai-ratio-commit-*; do',
+    '  [ -f "$ticket" ] || continue',
+    '  AI_RATIO_HOOK_PARENT=$PPID exec node "$(dirname "$0")/check-ai-ratio.js" --reference-transaction "$git_dir"',
+    'done'
+  ].join('\n')
+]);
 const MARKER = '.ai-ratio-off';
 const IMPORT_MARKER = '.ai-ratio-import-off';
 const SETTINGS = 'ai-ratio-guard.json';
@@ -19,7 +40,7 @@ const LEGACY_SCRIPT_HASHES = new Set([
   '44ac70916b63da611910d4010d5af4c13d33ce1ba5957547050e281476d4dbeb',
   '0465203c17b4a4976b843085b4baa86e6d79cb7aca3ec54c75fc3925e87f81ad'
 ]);
-const HOOK_TAG = 'guard-v10'; // bump whenever hooks/check-ai-ratio.js template changes
+const HOOK_VERSION = 33; // bump whenever hooks/check-ai-ratio.js template changes
 const DEFAULT_PCT = 50;
 
 const T = {
@@ -109,7 +130,7 @@ function uniqueLocations(states) {
 
 // Resolve roots with Git, preserving worktrees, submodules and hooksPath.
 function locate({ folder, required }) {
-  const options = { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+  const options = { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, LC_ALL: 'C' } };
   try {
     const cwd = execFileSync('git', ['-C', folder, 'rev-parse', '--show-toplevel'], options).trim();
@@ -177,7 +198,7 @@ async function readGuardStates(inputs) {
   const states = await Promise.all(inputs.map(async ({ folder, required }) => {
     const result = await new Promise(resolve => execFile('git', ['-C', folder, 'rev-parse',
       '--show-toplevel', '--git-path', 'hooks', '--git-common-dir'],
-    { encoding: 'utf8', timeout: 5000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    { encoding: 'utf8', timeout: 10000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, LC_ALL: 'C' } },
     (error, stdout) => resolve({ error, stdout })));
     if (result.error) return discoveryFailure(folder, required, result.error);
@@ -189,9 +210,28 @@ async function readGuardStates(inputs) {
   return uniqueLocations(states);
 }
 
+function normalizeHook(src) {
+  return src.replace(/\r\n/g, '\n').trimEnd();
+}
+
 function managedEntry(src) {
-  const normalize = s => s.replace(/\r\n/g, '\n').trimEnd();
-  return normalize(src) === normalize(fs.readFileSync(path.join(__dirname, 'hooks', ENTRY), 'utf8'));
+  return normalizeHook(src) === normalizeHook(fs.readFileSync(path.join(__dirname, 'hooks', ENTRY), 'utf8'));
+}
+
+function hookVersion(src) {
+  return Number(/^\/\/ guard-v(\d+):/m.exec(src)?.[1] || 0);
+}
+
+function retireReferenceHook(hooks) {
+  const file = path.join(hooks, REFERENCE_ENTRY);
+  try {
+    // Preserve custom hooks and links even if they delegate to this plugin.
+    if (fs.lstatSync(file).isFile() && LEGACY_REFERENCE_HOOKS.has(normalizeHook(fs.readFileSync(file, 'utf8')))) {
+      fs.unlinkSync(file);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn('[guard] could not retire the preview reference hook:', error.message);
+  }
 }
 
 function managedScript(src) {
@@ -208,7 +248,7 @@ function commonDir(hooks, cwd) {
   // the default .git/hooks layout used by standalone callers/tests.
   if (!cwd) return path.dirname(hooks);
   const dir = execFileSync('git', ['-C', cwd, 'rev-parse', '--git-common-dir'],
-    { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   return path.resolve(cwd, dir);
 }
 
@@ -274,8 +314,11 @@ function readState(hooks, cwd, resolvedCommonDir) {
 function writeHooks(hooks, pct, cwd, changes = {}) {
   const entry = path.join(hooks, ENTRY);
   // Trust boundary: never overwrite a pre-commit hook that is not ours.
-  if (fs.existsSync(entry) && !managedEntry(fs.readFileSync(entry, 'utf8'))) {
-    throw new Error(entry + T.foreignHook);
+  if (fs.existsSync(entry)) {
+    const source = fs.readFileSync(entry, 'utf8');
+    if (!managedEntry(source) && !LEGACY_TRANSACTION_PRECOMMIT.has(normalizeHook(source))) {
+      throw new Error(entry + T.foreignHook);
+    }
   }
   const script = path.join(hooks, SCRIPT);
   const existing = fs.existsSync(script) ? fs.readFileSync(script, 'utf8') : '';
@@ -301,6 +344,8 @@ function writeHooks(hooks, pct, cwd, changes = {}) {
   if (!fs.existsSync(entry) || !fs.readFileSync(entry).equals(tpl(ENTRY))) writeAtomic(entry, tpl(ENTRY));
   fs.chmodSync(entry, 0o755);
   writeAtomic(path.join(commonDir(hooks, cwd), SETTINGS), JSON.stringify(settings) + '\n');
+  const previousVersion = hookVersion(existing);
+  if (previousVersion >= 24 && previousVersion <= 28) retireReferenceHook(hooks);
 }
 
 // On activation: rewrite already-installed hooks whose embedded version tag
@@ -316,10 +361,12 @@ function autoUpgrade(vscode) {
   }).filter(Boolean);
   for (const { l, src } of snapshots) {
     if (!managedScript(src)) continue;
+    const version = hookVersion(src);
+    if (version > HOOK_VERSION) continue;
     // Isolate configuration/read failures as well as writes to this repository.
     try {
       const config = path.join(commonDir(l.hooks, l.cwd), SETTINGS);
-      if (src.includes(HOOK_TAG) && !src.includes('__AI_RATIO__') && entryReady(l.hooks)
+      if (version === HOOK_VERSION && !src.includes('__AI_RATIO__') && entryReady(l.hooks)
         && fs.existsSync(config)) continue;
       // Repair an outdated/placeholder checker or a missing/non-executable entry.
       // writeHooks preserves repository switches and refuses foreign entries.
@@ -334,7 +381,7 @@ function autoUpgrade(vscode) {
         changes.importOn = !fs.existsSync(path.join(l.hooks, IMPORT_MARKER));
       }
       writeHooks(l.hooks, s.threshold, l.cwd, changes);
-      console.log(`[guard] hook upgraded to ${HOOK_TAG} in ${l.cwd}`);
+      console.log(`[guard] hook upgraded to guard-v${HOOK_VERSION} in ${l.cwd}`);
     } catch (e) { console.error(`[guard] hook upgrade failed in ${l.cwd}:`, e.message || e); }
   }
 }

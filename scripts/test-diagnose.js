@@ -31,6 +31,7 @@ try {
   git(repo, ['config', 'user.email', 'test@example.invalid']);
   git(repo, ['config', 'user.name', 'Test']);
   git(repo, ['-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-qm', 'base']);
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '\n.git-ai-ignore\n.gitignore\n');
   const hooks = path.join(tmp, 'shared-hooks');
   git(repo, ['config', 'core.hooksPath', hooks]);
   guard.writeHooks(hooks, 80, repo);
@@ -50,6 +51,22 @@ try {
     assert(r.stdout.includes('有效阈值 = 80%（来源：仓库配置）'));
     assert(r.stdout.includes('BLOCKED: ratio < 80% threshold'));
   });
+  const gitAi = path.join(bin, 'git-ai');
+  const goodReply = fs.readFileSync(gitAi);
+  try {
+    for (const [cause, body] of [['command error', 'exit 1'], ['invalid JSON', "echo 'invalid'"]]) {
+      fs.writeFileSync(gitAi, `#!/bin/sh\n${body}\n`);
+      check(`live-daemon attribution failure is diagnosed: ${cause}`, () => {
+        const r = run();
+        assert.strictEqual(r.status, 1, r.stdout + r.stderr);
+        assert(r.stdout.includes('[PASS] daemon 存活'));
+        assert(r.stdout.includes('跳过原因：attribution query failed'));
+        assert(r.stdout.includes('点击「重新检查」'));
+      });
+    }
+  } finally {
+    fs.writeFileSync(gitAi, goodReply);
+  }
   for (const layout of ['without-tenant', 'explicit-home']) {
     check(`daemon discovery matches the hook: ${layout}`, () => {
       const home = path.join(tmp, layout), base = path.join(home, '.trae-cn', '.git-ai-tob');
@@ -180,13 +197,14 @@ try {
   }
   check('normal bulk rejection is not mistaken for a runtime failure', () => {
     const bulk = path.join(repo, 'bulk.txt'), ignored = path.join(repo, '.git-ai-ignore');
-    fs.writeFileSync(bulk, 'bulk\n'.repeat(10001)); git(repo, ['add', 'bulk.txt']);
+    const overrides = { NODE_OPTIONS: '--require ' + JSON.stringify(path.resolve(__dirname, '../test-fixtures/staged-bulk.cjs')) };
+    fs.writeFileSync(bulk, 'bulk\n'); git(repo, ['add', 'bulk.txt']);
     fs.writeFileSync(ignored, 'bulk.txt\n'); guard.writeHooks(hooks, 50, repo);
     try {
-      const r = run(repo, {}, '50'); assert.strictEqual(r.status, 0, r.stdout);
-      assert(r.stdout.includes('BLOCKED: bulk commit'));
+      const r = run(repo, overrides, '50'); assert.strictEqual(r.status, 0, r.stdout);
+      assert(r.stdout.includes('BLOCKED: bulk commit'), r.stdout);
       assert(r.stdout.includes('按校验规则拦截提交')); assert(!r.stdout.includes('校验脚本运行失败'));
-      const commit = spawnSync('git', ['commit', '-qm', 'bulk'], { cwd: repo, env, encoding: 'utf8' });
+      const commit = spawnSync('git', ['commit', '-qm', 'bulk'], { cwd: repo, env: { ...env, ...overrides }, encoding: 'utf8' });
       assert.strictEqual(commit.status, 1); assert(commit.stderr.includes('BLOCKED: bulk commit'));
     } finally {
       git(repo, ['rm', '--cached', 'bulk.txt']); fs.unlinkSync(bulk); fs.unlinkSync(ignored);
@@ -208,13 +226,14 @@ try {
   fs.unlinkSync(path.join(repo, '.gitignore'));
   check('info/exclude does not reduce the AI denominator', () => {
     fs.writeFileSync(ignore, 'generated/\n');
-    fs.writeFileSync(path.join(repo, '.git', 'info', 'exclude'), 'code.txt\n');
+    fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), 'code.txt\n');
     const r = run(); assert.strictEqual(r.status, 0, r.stdout); assert(r.stdout.includes('被忽略 0 行 → 分母 10 行'));
   });
   check('actual AI ignore matches both diagnostic and hook', () => {
     fs.writeFileSync(ignore, 'code.txt\n');
-    const r = run(); assert.strictEqual(r.status, 1, r.stdout);
+    const r = run(); assert.strictEqual(r.status, 0, r.stdout);
     assert(r.stdout.includes('10 行全部被忽略')); assert(!r.stdout.includes('[ai-ratio] BLOCKED'));
+    assert(r.stdout.includes('无参与占比校验的新增行，钩子放行属正常'));
   });
   check('tabs/newlines/CJK paths are counted and ignored exactly', () => {
     const name = 'special\t中文\nfile.txt';

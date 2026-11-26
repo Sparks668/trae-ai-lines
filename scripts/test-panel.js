@@ -36,15 +36,14 @@ const until = async condition => {
     let inputValue = '95', inputGate = null, inputOptions;
     let day = '2026-10-22';
     let sums = { ai: 12, total: 20, commits: 2 }, pending = { ai: 6, total: 8, gitAdds: 108, gitDels: 4 };
-    let pollError = null, pendingGate = null, pendingQueries = 0; const polls = [];
+    let pollError = null, pendingGate = null, pendingQueries = 0, invalid = 0; const polls = [];
     class Counter {
-      async poll(native) {
-        polls.push(!!native);
+      async poll(...args) {
+        polls.push(args.length);
         if (pollError) throw pollError;
-        this.lastRead = { source: 'native', files: ['/test/git-ai-daemon-2026-10-29.log'], errors: [] };
+        this.lastRead = { files: ['/test/internal/datafinder-db'], errors: [], invalid };
       }
-      sums() { return { ...sums }; }
-      listFiles() { return []; }
+      sums() { return sums && { ...sums }; }
     }
     const lib = { AiLinesCounter: Counter, localDate: () => day,
       uncommitted: async () => { pendingQueries++; const result = pending; if (pendingGate) await pendingGate; return result; },
@@ -100,7 +99,7 @@ const until = async condition => {
     check('activation keeps one refresh timer and creates no panel eagerly', () => {
       assert.strictEqual(timers.length, 1); assert.strictEqual(timers[0].ms, 30000); assert.strictEqual(panels.length, 0);
     });
-    check('startup and automatic refresh prefer native logs', () => assert.strictEqual(polls[0], true));
+    check('startup reads the local submission store', () => assert.strictEqual(polls[0], 0));
     check('tooltip exposes only the details command as a trusted link', () => {
       assert(items[0].tooltip.value.includes('command:aiLines.showDetails'));
       assert.deepStrictEqual(Array.from(items[0].tooltip.isTrusted.enabledCommands), ['aiLines.showDetails']);
@@ -117,13 +116,13 @@ const until = async condition => {
       assert.strictEqual(d.diff.adds, 108); assert.strictEqual(d.diff.dels, 4);
       assert.strictEqual(d.guards[0].threshold, 90); assert.strictEqual(d.guards[0].enabled, true);
       assert.strictEqual(d.guards[0].importOn, false); assert.strictEqual(d.workspace, repo); assert.strictEqual(d.version, pkg.version);
-      assert.strictEqual(d.logSource, 'daemon 原生日志');
+      assert.strictEqual(d.dataSource, 'Trae 本地上报库');
     });
     await until(() => !lastData().refreshing);
     const queriesBeforeSharedRefresh = guardQueries;
     await timers[0].fn();
     await flush();
-    check('automatic refresh keeps the same native-first policy as manual refresh', () => assert.strictEqual(polls.at(-1), true));
+    check('automatic refresh reads the same submission store', () => assert.strictEqual(polls.at(-1), 0));
     check('one refresh shares the guard query between status bar and open details', () => {
       assert.strictEqual(guardQueries - queriesBeforeSharedRefresh, 1);
       assert.strictEqual(lastData().refreshing, false);
@@ -346,7 +345,7 @@ const until = async condition => {
       assert.strictEqual(timers.length, 1);
     });
     await p.receive({ type: 'refresh' });
-    check('manual panel refresh uses the native-log refresh path', () => assert.strictEqual(polls.at(-1), true));
+    check('manual panel refresh reads the same submission store', () => assert.strictEqual(polls.at(-1), 0));
     const updatedAt = lastData().updatedAt;
     pollError = new Error('test read failure');
     await p.receive({ type: 'refresh' });
@@ -355,6 +354,22 @@ const until = async condition => {
       assert(d.error.includes('test read failure')); assert.strictEqual(d.refreshing, false);
     });
     pollError = null;
+    sums = null;
+    await p.receive({ type: 'refresh' });
+    check('an unavailable submission store stays distinct from a real zero', () => {
+      assert.strictEqual(lastData().committed, null);
+      assert.strictEqual(lastData().dataSource, 'Trae 本地上报库不可用');
+      assert.strictEqual(lastData().diff.adds, 8);
+      assert(items[0].tooltip.value.includes('今日提交：暂不可用'));
+    });
+    invalid = 1;
+    await p.receive({ type: 'refresh' });
+    check('an incomplete submission record identifies the cause in the data source', () => {
+      assert.strictEqual(lastData().committed, null);
+      assert.strictEqual(lastData().dataSource, 'Trae 本地上报库数据不完整');
+    });
+    invalid = 0;
+    sums = { ai: 30, total: 40, commits: 3 };
     let releaseRefresh;
     pendingGate = new Promise(resolve => { releaseRefresh = resolve; });
     const activeRefresh = commands['aiLines.refresh'](); await flush();
@@ -526,7 +541,8 @@ const until = async condition => {
     check('diagnosis can be retried after an error', () => assert.strictEqual(pendingQueries, retryBefore + 1));
     check('repeated diagnostics reuse and clear the same output channel', () => {
       assert.strictEqual(output.length, 1); assert.strictEqual(outputClears, clearsBefore + 3);
-      assert.strictEqual(output[0].filter(s => s.includes('--- 已提交统计链路')).length, 1);
+      assert.strictEqual(output[0].filter(s => s.includes('--- 已提交统计')).length, 1);
+      assert(output[0].some(s => s.includes('/test/internal/datafinder-db')));
     });
     fs.writeFileSync(path.join(repo, '.git/ai-ratio-guard.json'), oldConfig);
     await commands['aiLines.refresh']();

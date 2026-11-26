@@ -1,9 +1,8 @@
 'use strict';
 // Full-path regression suite for trae-ai-lines.
-// Usage: node test.js [targetDir]
-//   default target = this repo; pass the installed extension dir
-//   (~/.trae-cn/extensions/bobchen.trae-ai-lines-<ver>) to verify the
-//   packaged artifact. Rule-1 numbers are made deterministic via a fake
+// Usage: node test.js [targetDir] [artifactDir]
+//   Default target is this repo. To check package consistency, pass the
+//   extracted VSIX extension directory as artifactDir. Rule-1 numbers use a fake
 //   git-ai binary under an overridden HOME.
 const fs = require('fs');
 const os = require('os');
@@ -58,7 +57,9 @@ function fakeRuntime(home) {
   const bin = path.join(home, '.trae-cn', '.git-ai-tob', 'tob-git-ai-runtime', '1.0.0', 'x', 'host');
   fs.mkdirSync(bin, { recursive: true });
   fs.writeFileSync(path.join(bin, 'git-ai'),
-    '#!/bin/sh\necho \'{"stats":{"git_diff_added_lines":\'${FAKE_AI:-0}\',"human_additions":0,"unknown_additions":0}}\'\n');
+    '#!/bin/sh\n' +
+    'if [ "$1" = effective-ignore-patterns ]; then printf "%s\\n" "${FAKE_IGNORE_PATTERNS:-[]}"\n' +
+    'else echo \'{"stats":{"git_diff_added_lines":\'${FAKE_AI:-0}\',"human_additions":0,"unknown_additions":0}}\'\nfi\n');
   fs.chmodSync(path.join(bin, 'git-ai'), 0o755);
 }
 (function buildFakeHome() {
@@ -72,6 +73,11 @@ function fakeRuntime(home) {
   fakeRuntime(NODAEMON_HOME); // same binary, deliberately NO pid registry
   fs.mkdirSync(DEAD_HOME, { recursive: true });
 })();
+const bulkFixture = { NODE_OPTIONS: '--require ' + JSON.stringify(path.join(ROOT, 'test-fixtures', 'staged-bulk.cjs')) };
+function writeAIIgnore(repo, contents) {
+  fs.writeFileSync(path.join(repo, '.git-ai-ignore'), contents);
+  fs.appendFileSync(path.join(repo, '.git', 'info', 'exclude'), '\n.git-ai-ignore\n.gitignore\n');
+}
 function runHook(script, repo, opts) {
   const o = opts || {};
   const env = Object.assign({}, process.env, { GIT_AI_CWD: repo });
@@ -109,9 +115,9 @@ console.log('A. hook behavior');
 }
 { // A3 git-ai unavailable + bulk -> rule 2 blocks
   const r = mkrepo('a3');
-  lines(r, 'bulk.txt', 20000); add(r, ['bulk.txt']);
+  lines(r, 'bulk.txt', 1); add(r, ['bulk.txt']);
   const s = installHook(r, 0.50);
-  const h = runHook(s, r, { home: DEAD_HOME });
+  const h = runHook(s, r, { home: DEAD_HOME, extra: bulkFixture });
   ok('A3 git-ai dead + bulk import -> rule2 blocks', h.code === 1 && h.out.includes('import guard') && h.out.includes('BLOCKED'), h.out.trim());
 }
 { // A4 master off setting
@@ -143,64 +149,58 @@ console.log('A. hook behavior');
 }
 { // A7 threshold value enforced
   const r1 = mkrepo('a7a');
-  lines(r1, 'f.txt', 100); add(r1, ['f.txt']);
+  lines(r1, 'f.txt', 2); add(r1, ['f.txt']);
   const s1 = installHook(r1, '1.00');
-  const b = runHook(s1, r1, { home: FAKE_HOME, ai: 60 });
-  ok('A7a threshold 100% -> 60% blocked', b.code === 1 && b.out.includes('ratio < 100%'), b.out.trim());
+  const b = runHook(s1, r1, { home: FAKE_HOME, ai: 1 });
+  ok('A7a threshold 100% -> 50% blocked', b.code === 1 && b.out.includes('ratio < 100%'), b.out.trim());
   const r2 = mkrepo('a7b');
-  lines(r2, 'f.txt', 100); add(r2, ['f.txt']);
+  lines(r2, 'f.txt', 2); add(r2, ['f.txt']);
   const s2 = installHook(r2, '0.50');
-  const p = runHook(s2, r2, { home: FAKE_HOME, ai: 60 });
-  ok('A7b threshold 50% -> 60% pass', p.code === 0, p.out.trim());
+  const p = runHook(s2, r2, { home: FAKE_HOME, ai: 1 });
+  ok('A7b threshold 50% -> 50% pass', p.code === 0, p.out.trim());
 }
 { // A8 .git-ai-ignore subtracts from denominator
   const r = mkrepo('a8');
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'gen.txt\n');
-  lines(r, 'gen.txt', 100); lines(r, 'real.txt', 100); add(r, ['gen.txt', 'real.txt']);
+  writeAIIgnore(r, 'gen.txt\n');
+  lines(r, 'gen.txt', 1); lines(r, 'real.txt', 1); add(r, ['gen.txt', 'real.txt']);
   const s = installHook(r, '0.70');
-  // 80/100 = 80% >= 70% pass; without subtraction 80/200 = 40% would block
-  const h = runHook(s, r, { home: FAKE_HOME, ai: 80 });
-  ok('A8 ignore subtraction -> 80/100 passes 70%', h.code === 0 && /ignored 100/.test(h.out), h.out.trim());
+  // Excluding the generated line raises 1/2 to 1/1.
+  const h = runHook(s, r, { home: FAKE_HOME, ai: 1 });
+  ok('A8 ignore subtraction -> 1/1 passes 70%', h.code === 0 && /ignored 1/.test(h.out), h.out.trim());
 }
 { // A9 CJK filename in ignore
   const r = mkrepo('a9');
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), '\u6587\u4ef6\u540d.txt\n');
-  lines(r, '\u6587\u4ef6\u540d.txt', 50); lines(r, 'real.txt', 50); add(r, ['\u6587\u4ef6\u540d.txt', 'real.txt']);
-  const s = installHook(r, '0.50');
-  // ignored 50 -> visible 50, 40/50 = 80% pass; if CJK path broken visible=100, 40% block
-  const h = runHook(s, r, { home: FAKE_HOME, ai: 40 });
-  ok('A9 CJK path ignored -> pass + ignored 50', h.code === 0 && /ignored 50/.test(h.out), h.out.trim());
+  writeAIIgnore(r, '\u6587\u4ef6\u540d.txt\n');
+  lines(r, '\u6587\u4ef6\u540d.txt', 1); lines(r, 'real.txt', 1); add(r, ['\u6587\u4ef6\u540d.txt', 'real.txt']);
+  const s = installHook(r, '0.80');
+  const h = runHook(s, r, { home: FAKE_HOME, ai: 1 });
+  ok('A9 CJK path ignored -> pass + ignored 1', h.code === 0 && /ignored 1/.test(h.out), h.out.trim());
 }
 { // A10 rename staged, no crash
   const r = mkrepo('a10');
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'gen2.js\n');
-  lines(r, 'gen.js', 200); lines(r, 'real.txt', 100); add(r, ['gen.js', 'real.txt']);
+  writeAIIgnore(r, 'gen2.js\n');
+  fs.writeFileSync(path.join(r, 'gen.js'), 'existing generated content\n');
+  lines(r, 'real.txt', 1); add(r, ['gen.js', 'real.txt']);
   execFileSync('git', ['-C', r, 'commit', '-q', '-m', 'c', '--no-verify']);
-  lines(r, 'real.txt', 200); // modify after commit
+  lines(r, 'real.txt', 2); // modify after commit
   execFileSync('git', ['-C', r, 'mv', 'gen.js', 'gen2.js']);
-  fs.appendFileSync(path.join(r, 'gen2.js'), 'extra\n');
+  fs.appendFileSync(path.join(r, 'gen2.js'), 'x\n');
   add(r, ['gen2.js', 'real.txt']);
   const s = installHook(r, '0.50');
-  const h = runHook(s, r, { home: FAKE_HOME, ai: 100 });
+  const h = runHook(s, r, { home: FAKE_HOME, ai: 1 });
   ok('A10 rename + ignore new path -> no crash, ignored counted', h.code === 0 && /ignored \d+/.test(h.out), h.code + ' :: ' + h.out.trim());
 }
-{ // A11 rule 2 fires only in band, import sub-switch skips it
-  const mk = (name) => {
-    const r = mkrepo(name);
-    fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'gen.txt\n');
-    lines(r, 'gen.txt', 15000); lines(r, 'real.txt', 5000); add(r, ['gen.txt', 'real.txt']);
-    return r;
-  };
-  const r1 = mk('a11a');
-  const s1 = installHook(r1, '0.50');
-  // visible 5000, ai 4000 -> 80% passes rule1; raw 20000 in band, ai<5000 -> rule2 blocks
-  const b = runHook(s1, r1, { home: FAKE_HOME, ai: 4000 });
-  ok('A11a bulk import -> rule2 blocks despite rule1 pass', b.code === 1 && b.out.includes('import guard'), b.out.trim());
-  const r2 = mk('a11b');
-  const s2 = installHook(r2, '0.50');
-  changeSettings(r2, { importOn: false });
-  const p = runHook(s2, r2, { home: FAKE_HOME, ai: 4000 });
-  ok('A11b import disabled -> rule2 skipped', p.code === 0, p.out.trim());
+for (const test of [{ name: 'A11a', importOn: true, expected: 1 }, { name: 'A11b', importOn: false, expected: 0 }]) {
+  const r = mkrepo(test.name);
+  writeAIIgnore(r, 'bulk.txt\n');
+  lines(r, 'bulk.txt', 1); lines(r, 'real.txt', 1); add(r, ['bulk.txt', 'real.txt']);
+  const hook = installHook(r, 0.50);
+  changeSettings(r, { importOn: test.importOn });
+  const result = runHook(hook, r, { home: FAKE_HOME, ai: 1, extra: bulkFixture });
+  // Rule 1 sees 1/1. Rule 2 also sees the 20,000 simulated ignored lines.
+  ok(test.name + ' bulk threshold follows the import switch',
+    result.code === test.expected && /commit AI 1 \/ 1/.test(result.out)
+    && result.out.includes('import guard') === test.importOn, result.out.trim());
 }
 { // A12 binary present but daemon offline -> rule 1 skipped, NEVER exec the
   // CLI (it would auto-spawn a config-less daemon that the Trae extension
@@ -215,40 +215,42 @@ console.log('A. hook behavior');
 }
 { // A13 daemon offline + bulk import -> rule 2 (pure git) still blocks
   const r = mkrepo('a13');
-  lines(r, 'bulk.txt', 20000); add(r, ['bulk.txt']);
+  lines(r, 'bulk.txt', 1); add(r, ['bulk.txt']);
   const s = installHook(r, '0.50');
-  const h = runHook(s, r, { home: NODAEMON_HOME, ai: 0 });
+  const h = runHook(s, r, { home: NODAEMON_HOME, ai: 0, extra: bulkFixture });
   ok('A13 daemon offline + bulk -> rule2 blocks', h.code === 1 && h.out.includes('import guard') && h.out.includes('BLOCKED'), h.out.trim());
 }
 
 { // A14 ordinary .gitignore must not remove tracked manual code from the denominator
   const r = mkrepo('a14');
   fs.writeFileSync(path.join(r, '.gitignore'), 'manual.txt\n');
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'generated.txt\n');
-  lines(r, 'manual.txt', 100); lines(r, 'ai.txt', 1);
+  writeAIIgnore(r, 'generated.txt\n');
+  lines(r, 'manual.txt', 1); lines(r, 'ai.txt', 1);
   execFileSync('git', ['-C', r, 'add', '-f', '--', 'manual.txt', 'ai.txt']);
   const h = runHook(installHook(r, '0.80'), r, { home: FAKE_HOME, ai: 1 });
-  ok('A14 gitignore does not inflate 1/101 into 1/1', h.code === 1 && /commit AI 1 \/ 101 lines/.test(h.out), h.out.trim());
+  ok('A14 gitignore does not inflate 1/2 into 1/1', h.code === 1 && /commit AI 1 \/ 2 lines/.test(h.out), h.out.trim());
 }
-{ // A15 keep the existing partial-staging behavior, explicitly requested by the user
+{ // A15 a partial commit uses the original ratio, with a strict upper bound
   const r = mkrepo('a15');
-  lines(r, 'ai.txt', 1); add(r, ['ai.txt']);
-  execFileSync('git', ['-C', r, 'commit', '-q', '-m', 'base-ai', '--no-verify']);
-  lines(r, 'manual.txt', 100); add(r, ['manual.txt']);
-  lines(r, 'ai.txt', 101);
-  const h = runHook(installHook(r, '0.80'), r, { home: FAKE_HOME, ai: 100 });
-  ok('A15 partial staging still passes with the original warning',
-    h.code === 0 && /ratio 100.0%/.test(h.out) && /100 unstaged lines inflate/.test(h.out), h.out.trim());
+  lines(r, 'staged.txt', 1); add(r, ['staged.txt']);
+  lines(r, 'outside.txt', 1);
+  const hook = installHook(r, 0.80);
+  const exact = runHook(hook, r, { home: FAKE_HOME, ai: 1 });
+  ok('A15a exactly 100% passes with another new file outside the commit',
+    exact.code === 0 && /commit AI 1 \/ 1/.test(exact.out), exact.out.trim());
+  const excess = runHook(hook, r, { home: FAKE_HOME, ai: 2 });
+  ok('A15b a ratio above 100% is blocked',
+    excess.code === 1 && /BLOCKED: ratio > 100%/.test(excess.out), excess.out.trim());
 }
 { // A16 numstat's compact directory rename must resolve to the real destination
   const r = mkrepo('a16');
   fs.mkdirSync(path.join(r, 'src'));
-  lines(r, 'src/old.js', 200); add(r, ['src/old.js']);
+  fs.writeFileSync(path.join(r, 'src/old.js'), 'existing generated content\n'); add(r, ['src/old.js']);
   execFileSync('git', ['-C', r, 'commit', '-q', '-m', 'base-file', '--no-verify']);
   execFileSync('git', ['-C', r, 'mv', 'src/old.js', 'src/new.js']);
-  fs.appendFileSync(path.join(r, 'src/new.js'), 'extra\n');
+  fs.appendFileSync(path.join(r, 'src/new.js'), 'x\n');
   lines(r, 'real.txt', 1); add(r, ['src/new.js', 'real.txt']);
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'src/new.js\n');
+  writeAIIgnore(r, 'src/new.js\n');
   const h = runHook(installHook(r, '0.80'), r, { home: FAKE_HOME, ai: 1 });
   ok('A16 nested rename ignores exactly its one added line',
     h.code === 0 && /commit AI 1 \/ 1 lines \(raw 2, ignored 1\)/.test(h.out), h.out.trim());
@@ -257,21 +259,21 @@ console.log('A. hook behavior');
   const r = mkrepo('a17');
   fs.mkdirSync(path.join(r, 'generated'));
   fs.writeFileSync(path.join(r, '.gitignore'), '!generated/**\n');
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'generated/**\n!generated/keep.txt\n');
-  lines(r, 'generated/auto.txt', 100); lines(r, 'generated/keep.txt', 20); lines(r, 'real.txt', 80);
+  writeAIIgnore(r, 'generated/**\n!generated/keep.txt\n');
+  lines(r, 'generated/auto.txt', 2); lines(r, 'generated/keep.txt', 1); lines(r, 'real.txt', 1);
   add(r, ['generated/auto.txt', 'generated/keep.txt', 'real.txt']);
-  const h = runHook(installHook(r, '0.70'), r, { home: FAKE_HOME, ai: 80 });
+  const h = runHook(installHook(r, '0.70'), r, { home: FAKE_HOME, ai: 2 });
   ok('A17 git-ai-ignore negation works without gitignore precedence',
-    h.code === 0 && /commit AI 80 \/ 100 lines \(raw 200, ignored 100\)/.test(h.out), h.out.trim());
+    h.code === 0 && /commit AI 2 \/ 2 lines \(raw 4, ignored 2\)/.test(h.out), h.out.trim());
 }
 { // A18 Git quotes tabs/newlines even with core.quotepath=false; NUL paths stay exact
   const r = mkrepo('a18');
   const name = 'generated\tfile\nwith space.txt';
-  fs.writeFileSync(path.join(r, '.git-ai-ignore'), 'generated*\n');
-  lines(r, name, 100); lines(r, 'real.txt', 1); add(r, [name, 'real.txt']);
+  writeAIIgnore(r, 'generated*\n');
+  lines(r, name, 1); lines(r, 'real.txt', 1); add(r, [name, 'real.txt']);
   const h = runHook(installHook(r, '0.80'), r, { home: FAKE_HOME, ai: 1 });
   ok('A18 special filename ignored without quoted-path mismatch',
-    h.code === 0 && /commit AI 1 \/ 1 lines \(raw 101, ignored 100\)/.test(h.out), h.out.trim());
+    h.code === 0 && /commit AI 1 \/ 1 lines \(raw 2, ignored 1\)/.test(h.out), h.out.trim());
 }
 
 // ---------- B. guard module ----------
@@ -573,10 +575,10 @@ const readOf = r => fs.readFileSync(scriptOf(r), 'utf8');
     g.toggleImport(mvs(a), item);
     ok('B18d shared hook import switches are per repo',
       !g.readState(h, a).importOn && g.readState(h, b).importOn);
-    for (const r of [a, b]) { lines(r, 'bulk.txt', 20000); add(r, ['bulk.txt']); }
+    for (const r of [a, b]) { lines(r, 'bulk.txt', 1); add(r, ['bulk.txt']); }
     ok('B18d2 shared hook enforces each repo import switch',
-      runHook(hook, a, { home: DEAD_HOME }).code === 0
-      && runHook(hook, b, { home: DEAD_HOME }).code === 1);
+      runHook(hook, a, { home: DEAD_HOME, extra: bulkFixture }).code === 0
+      && runHook(hook, b, { home: DEAD_HOME, extra: bulkFixture }).code === 1);
     g.toggle(mvs(a), item);
     ok('B18e shared hook master switches are per repo',
       !g.readState(h, a).enabled && g.readState(h, b).enabled
@@ -819,14 +821,57 @@ if (process.platform !== 'win32') { // B24 group execute must not hide a non-exe
     newState.threshold === 50 && newState.importOn
     && results.filter(r => r.status === 'failed').every(r => r.error && r.cwd)
     && warnings.length === 1);
-  lines(fresh, 'manual.txt', 93); add(fresh, ['manual.txt']);
-  const commit = spawnSync('git', ['commit', '-qm', '93 manual lines'], { cwd: fresh,
+  lines(fresh, 'manual.txt', 1); add(fresh, ['manual.txt']);
+  const commit = spawnSync('git', ['commit', '-qm', 'one manual line'], { cwd: fresh,
     encoding: 'utf8', env: { ...process.env, HOME: FAKE_HOME, FAKE_AI: '0',
       AI_RATIO_OFF: '', AI_RATIO_MIN: '', GIT_AI_CWD: '', GIT_AI_DAEMON_HOME: '', GIT_AI_DAEMON_CONTROL_SOCKET: '' } });
-  ok('B29 bulk-installed hooks really block a 93-line non-AI commit',
+  ok('B29 bulk-installed hooks really block a one-line non-AI commit',
     commit.status === 1 && (commit.stdout + commit.stderr).includes('BLOCKED: ratio < 50%'));
   const empty = mvs(fresh); empty.workspace.workspaceFolders = [];
   ok('B29 no repositories produces an empty result without installing anything', g.enableAll(empty, {}).length === 0);
+}
+
+{ // B30 migrate both previous two-hook layouts while preserving settings.
+  const referencePrefix = [
+    '#!/bin/sh', '# managed by ai-ratio-guard', '[ "$1" = prepared ] || exit 0',
+    'git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null) || exit 0'
+  ];
+  const v24Reference = [...referencePrefix,
+    'ticket="$git_dir/ai-ratio-commit-$PPID"', '[ -f "$ticket" ] || exit 0',
+    'exec node "$(dirname "$0")/check-ai-ratio.js" --reference-transaction "$ticket"', ''
+  ].join('\n');
+  const v28Reference = [...referencePrefix,
+    'command -v node >/dev/null 2>&1 || exit 0',
+    'for ticket in "$git_dir"/ai-ratio-commit-*; do', '  [ -f "$ticket" ] || continue',
+    '  AI_RATIO_HOOK_PARENT=$PPID exec node "$(dirname "$0")/check-ai-ratio.js" --reference-transaction "$git_dir"',
+    'done', ''
+  ].join('\n');
+  const currentEntry = fs.readFileSync(ENTRY, 'utf8');
+  const layouts = [
+    { version: 24, parent: 'AI_RATIO_GIT_PID', contents: v24Reference, foreign: false },
+    { version: 28, parent: 'AI_RATIO_HOOK_PARENT', contents: v28Reference, foreign: false },
+    { version: 28, parent: 'AI_RATIO_HOOK_PARENT', contents: v28Reference + '# project-owned change\n', foreign: true }
+  ];
+  for (const { version, parent, contents, foreign } of layouts) {
+    const kind = foreign ? 'custom' : 'managed';
+    const repo = mkrepo(`b30-${version}-${kind}`);
+    const checker = installHook(repo, '0.87');
+    const hooks = path.dirname(checker);
+    const entry = path.join(hooks, 'pre-commit');
+    const reference = path.join(hooks, 'reference-transaction');
+    const oldEntry = currentEntry.replace('\nnode ', `\n${parent}=$PPID exec node `).trimEnd() + ' --pre-commit\n';
+    fs.writeFileSync(checker, fs.readFileSync(checker, 'utf8').replace(HOOK_TAG, `guard-v${version}`));
+    fs.writeFileSync(entry, oldEntry);
+    fs.writeFileSync(reference, contents, { mode: 0o755 });
+    changeSettings(repo, { enabled: !foreign, importOn: false });
+    g.autoUpgrade(mvs(repo));
+    const s = g.readState(hooks, repo);
+    ok(`B30 v${version} upgrades and preserves settings with ${kind} reference hook`,
+      fs.readFileSync(checker, 'utf8').includes(HOOK_TAG) && fs.readFileSync(entry, 'utf8') === currentEntry
+      && s.enabled === !foreign && s.threshold === 87 && !s.importOn);
+    ok(`B30 v${version} leaves only project-owned reference hooks`,
+      foreign ? fs.readFileSync(reference, 'utf8') === contents : !fs.existsSync(reference));
+  }
 }
 
 // ---------- C. lib self-check ----------
@@ -1008,80 +1053,27 @@ console.log('C. lib self-check');
     !g.readState(h, repo).enabled && fs.readFileSync(script, 'utf8').includes(HOOK_TAG));
 }
 
-{ // C4 native/mirror interleaving, including a reverse-order amend chain
-  ASYNC.push((async () => {
-    const { AiLinesCounter, localDate } = require(path.join(TARGET, 'lib.js'));
-    const root = path.join(TMP, 'c4-mirror'), native = path.join(TMP, 'c4-native');
-    const md = path.join(root, localDate().replace(/-/g, '') + 'T090000');
-    const nd = path.join(native, 'tenant', 'internal', 'daemon', 'logs');
-    fs.mkdirSync(md, { recursive: true }); fs.mkdirSync(nd, { recursive: true });
-    const mf = path.join(md, 'Trae Coding Analysis Daemon.log');
-    const nf = path.join(nd, `git-ai-daemon-${localDate()}.log`);
-    const event = (hash, n, previous, file = false) => `${localDate()}T12:00:00.000 INFO datafinder: event [${file ? 'git_ai_commit_file' : 'git_ai_commit_attribution'}] core_payload=${JSON.stringify({
-      commit_hash: hash, total_ai_committed_added_lines: n, total_lines_added: n,
-      amended_from_commit_hash: previous, ...(file ? { file_path: 'f.txt', ai_lines: n } : {})
-    })}\n`;
-    const old = event('old', 10), next = event('next', 20, 'old');
-    fs.writeFileSync(mf, ''); fs.writeFileSync(nf, old + next);
-    const c = new AiLinesCounter(root, native);
-    await c.poll(false); await c.poll(true);
-    fs.appendFileSync(mf, old + event('old', 10, undefined, true)); await c.poll(false);
-    ok('C4a delayed old attribution/file events do not resurrect amended commit',
-      c.sums().ai === 20 && c.sums().total === 20 && c.sums().commits === 1, JSON.stringify(c.sums()));
-    fs.appendFileSync(nf, event('latest', 30, 'middle')); await c.poll(true);
-    fs.appendFileSync(mf, event('middle', 25, 'next') + next + old); await c.poll(false);
-    ok('C4b reversed amend chain keeps only latest commit',
-      c.sums().ai === 30 && c.sums().commits === 1, JSON.stringify(c.sums()));
-    fs.appendFileSync(mf, event('independent', 5)); await c.poll(false);
-    ok('C4c unrelated commits are still counted', c.sums().ai === 35 && c.sums().commits === 2);
-    // Simulate the daily reset without changing the machine clock.
-    c.day = '1900-01-01';
-    fs.appendFileSync(mf, old); await c.poll(false);
-    ok('C4d daily reset also clears obsolete-commit tracking', c.sums().ai === 10 && c.sums().commits === 1);
-  })());
-}
-
 // ---------- D. artifact consistency ----------
 console.log('D. artifact consistency');
 {
   const v = JSON.parse(fs.readFileSync(path.join(TARGET, 'package.json'), 'utf8')).version;
   ok(`D1 package.json version reads ${v}`, /^\d+\.\d+\.\d+$/.test(v));
-  // Locate the ACTIVE install via the registry (extensions.json is the source
-  // of truth - the dir name may lag the content version when installs were
-  // done by in-place content replacement).
-  let inst = null;
-  try {
-    const reg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.trae-cn', 'extensions', 'extensions.json'), 'utf8'));
-    const entries = Array.isArray(reg) ? reg : reg.extensions || [];
-    const e = entries.find(x => (x.identifier || {}).id === 'bobchen.trae-ai-lines');
-    if (e && e.location && e.location.path) inst = e.location.path;
-  } catch { /* registry unreadable */ }
-  if (!inst || !fs.existsSync(inst)) {
-    // fallback: any bobchen.trae-ai-lines-* dir whose package.json matches source version
+  if (process.argv[3]) {
+    const artifact = path.resolve(process.argv[3]);
+    const files = ['package.json', 'guard.js', 'extension.js', 'lib.js', 'panel.js', 'icon.png',
+      'hooks/check-ai-ratio.js', 'hooks/pre-commit', 'scripts/diagnose-ai-guard.sh', 'scripts/diagnose-ai-guard.ps1'];
     try {
-      const extsDir = path.join(os.homedir(), '.trae-cn', 'extensions');
-      for (const d of fs.readdirSync(extsDir)) {
-        if (!d.startsWith('bobchen.trae-ai-lines-')) continue;
-        const pj = path.join(extsDir, d, 'package.json');
-        try {
-          if (JSON.parse(fs.readFileSync(pj, 'utf8')).version === v) { inst = path.join(extsDir, d); break; }
-        } catch { /* skip broken dir */ }
-      }
-    } catch { /* extensions dir unreadable */ }
-  }
-  if (inst) {
-    const iv = JSON.parse(fs.readFileSync(path.join(inst, 'package.json'), 'utf8')).version;
-    // An older installed release is expected while developing a new version.
-    if (iv === v) {
-      const same = ['guard.js', 'extension.js', 'lib.js', 'hooks/check-ai-ratio.js', 'hooks/pre-commit']
-        .every(f => fs.readFileSync(path.join(TARGET, f)).equals(fs.readFileSync(path.join(inst, f))));
-      ok('D2 installed artifact identical to target', same);
-      ok('D3 installed version matches', iv === v);
-    } else {
-      console.log(`  --  installed ${iv} differs from target ${v}, skipping D2/D3`);
+      const different = files.filter(f => !fs.readFileSync(path.join(TARGET, f)).equals(fs.readFileSync(path.join(artifact, f))));
+      ok('D2 extracted artifact matches target files', different.length === 0, different.join(', '));
+    } catch (e) {
+      ok('D2 extracted artifact matches target files', false, e.message);
     }
-  } else {
-    console.log(`  --  installed dir for ${v} not present, skipping D2/D3`);
+    try {
+      const artifactVersion = JSON.parse(fs.readFileSync(path.join(artifact, 'package.json'), 'utf8')).version;
+      ok('D3 extracted artifact version matches target', artifactVersion === v, artifactVersion);
+    } catch (e) {
+      ok('D3 extracted artifact version matches target', false, e.message);
+    }
   }
 }
 {

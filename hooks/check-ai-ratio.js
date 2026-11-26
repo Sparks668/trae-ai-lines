@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-// guard-v10: version tag - the extension rewrites this hook on startup when
+// guard-v33: version tag - the extension rewrites this hook on startup when
 // this tag differs from the packaged template, so plugin upgrades propagate
 // without manual off/on toggling.
 // v6 change: never exec `git-ai status` without a live daemon (daemonEnv
@@ -116,6 +116,9 @@ function exec(cmd, args, daemon = {}) {
     execFile(cmd, args, { cwd, timeout: 15000, maxBuffer: 10 * 1024 * 1024, env }, (e, so) => resolve(e ? null : so)));
 }
 
+// Ignore callbacks from a reference hook left over from a preview build.
+if (process.argv[2] === '--reference-transaction') process.exit(0);
+
 (async () => {
   const common = await exec('git', ['rev-parse', '--git-common-dir']);
   if (common === null) { console.log('[ai-ratio] git directory unavailable, skip'); return; }
@@ -192,6 +195,9 @@ function exec(cmd, args, daemon = {}) {
         settled = true;
       } catch { /* parse failure: keep totals at 0 */ }
     }
+    if (!settled && rawTotal > 0) {
+      console.log('[ai-ratio] note: git-ai attribution query failed, AI-ratio check skipped this commit');
+    }
   }
 
   // Rule 1: ratio check. Numerator = net settled AI; denominator = real staged
@@ -206,6 +212,11 @@ function exec(cmd, args, daemon = {}) {
   if (settled && visible > 0) {
     const ratio = ai / visible;
     console.log(`[ai-ratio] commit AI ${ai} / ${visible} lines (raw ${rawTotal}${ignoredAdds !== null ? `, ignored ${ignoredAdds}` : ''}${unstagedAdds ? `, unstaged ${unstagedAdds} (settles into this ratio!)` : ''}), ratio ${(ratio * 100).toFixed(1)}%`);
+    if (ai > visible) {
+      console.error('[ai-ratio] BLOCKED: ratio > 100%');
+      console.error('存在部分暂存提交，无法精确计算本次提交的贡献率，检查无误后可关闭校验点后进行提交。');
+      process.exit(1);
+    }
     if (unstagedAdds > 0) {
       console.log(`[ai-ratio] note: git-ai settles the whole tree; ${unstagedAdds} unstaged lines inflate the ratio above what THIS commit alone deserves`);
     }

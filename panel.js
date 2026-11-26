@@ -56,7 +56,7 @@ footer { border-top: 1px solid var(--vscode-panel-border, #454545); padding-top:
 <header><div><h1>Trae AI Lines</h1><div class="muted subtitle">统计详情 · <span id="date">—</span></div></div>
 <div class="actions"><button id="refresh" type="button">立即刷新</button><button id="diagnose" class="secondary" type="button">运行诊断</button></div></header>
 <div id="error" class="error" role="alert" hidden></div>
-<section><div class="section-head"><h2>今日提交</h2><span class="muted subtitle">本机 Trae 日志汇总</span></div>
+<section><div class="section-head"><h2>今日提交</h2><span class="muted subtitle">本机 Trae 上报库</span></div>
 <div class="metrics"><div><div class="label">AI 提交行数</div><div class="value ai"><span id="committed-ai">—</span><span class="unit">行</span></div></div>
 <div><div class="label">总提交行数</div><div class="value"><span id="committed-total">—</span><span class="unit">行</span></div></div>
 <div><div class="label">提交次数</div><div class="value"><span id="commits">—</span><span class="unit">次</span></div></div></div></section>
@@ -71,8 +71,7 @@ footer { border-top: 1px solid var(--vscode-panel-border, #454545); padding-top:
 <p class="muted hint">批量导入规则：暂存新增超过 10,000 且少于 50,000 行，AI 不足 5,000 行时拦截；此规则使用未过滤的暂存行数。</p></section>
 <section><div class="section-head"><h2>数据与刷新</h2></div><dl>
 <dt>统计工作区</dt><dd id="workspace" class="path">—</dd>
-<dt>数据源</dt><dd>自动、手动刷新均优先读取 daemon 原生日志，不可用时回退镜像日志。按事件日期统计，覆盖今天仍有更新的旧日志。未提交 AI 数据来自 git-ai status。</dd>
-<dt>本次来源</dt><dd id="log-source">—</dd>
+<dt>已提交来源</dt><dd id="commit-source">—</dd>
 <dt>刷新方式</dt><dd id="source">—</dd><dt>最近更新</dt><dd id="updated-at">尚未完成刷新</dd>
 <dt>自动刷新</dt><dd>每 30 秒，与状态栏同步</dd></dl></section>
 <footer class="muted"><span>固定详情页 · 可直接截图</span><span id="version"></span></footer>
@@ -91,7 +90,7 @@ function render(d) {
   text('pending-status', d.pending ? '当前工作区' : !d.workspace ? '未打开工作区' : d.refreshing && !d.updatedAt ? '读取中' : 'AI 查询不可用');
   text('workspace', d.workspace || '未打开工作区');
   text('source', !d.updatedAt ? '待读取' : d.manual ? '手动刷新' : '自动刷新');
-  text('log-source', d.updatedAt ? d.logSource || '原生日志优先' : null);
+  text('commit-source', d.updatedAt ? d.dataSource : null);
   text('updated-at', d.updatedAt ? new Date(d.updatedAt).toLocaleString('zh-CN', { hour12: false }) : '尚未完成刷新');
   const error = document.getElementById('error'); error.hidden = !d.error;
   error.textContent = d.error ? '刷新失败：' + d.error + (d.updatedAt ? '。当前保留上次成功的数据。' : '') : '';

@@ -11,7 +11,11 @@ scripts/test-diagnose.js
 scripts/test-buffer.js
 scripts/test-details-query.js
 scripts/test-repository-discovery.js
-scripts/test-log-sources.js
+scripts/test-commit-stats.js
+scripts/test-partial-staging.js
+scripts/release.sh
+scripts/start-trae-ai-daemon.ps1
+scripts/start-trae-with-node.command
 test-fixtures/**
 DESIGN.md
 使用说明.md
